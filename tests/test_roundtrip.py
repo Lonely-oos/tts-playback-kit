@@ -23,9 +23,26 @@ ROOT = os.path.dirname(HERE)
 BRIDGE = os.path.join(ROOT, 'bridge', 'tts_bridge.py')
 ENGINE = os.path.join(ROOT, 'bridge', 'fake_engine.py')
 
-PORT = 8791
-BASE = 'http://127.0.0.1:%d' % PORT
 FAILS = []
+
+
+def pick_port():
+    """让系统给一个空闲端口。
+
+    为什么不写死 8791：GitHub 的 Windows runner 上有一段被 Hyper-V 保留的动态端口，
+    写死端口可能直接 bind 失败（WinError 10013），而本地机器往往没有这段保留。
+    第一次 CI 就栽在这里 —— 桥根本没起来。
+    """
+    import socket
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+PORT = None
+BASE = None
 
 
 def ok(cond, msg):
@@ -50,26 +67,50 @@ def get(path, timeout=10):
         return json.loads(r.read().decode('utf-8'))
 
 
-def wait_up(deadline=25):
+def wait_up(deadline=25, logfile=None, proc=None):
     t0 = time.time()
     while time.time() - t0 < deadline:
         try:
             return get('/health')
         except Exception:
+            if proc is not None and proc.poll() is not None:
+                break
             time.sleep(0.3)
-    raise RuntimeError('bridge 没有起来')
+    detail = ''
+    if logfile and os.path.exists(logfile):
+        detail = '\n----- bridge 输出 -----\n' + open(logfile, encoding='utf-8', errors='replace').read()[-3000:]
+    raise RuntimeError('bridge 没有起来（端口 %s）%s' % (PORT, detail))
 
 
 def main():
+    global PORT, BASE
     tmp = tempfile.mkdtemp(prefix='tts-kit-')
     queue = os.path.join(tmp, 'queue')
     outdir = os.path.join(tmp, 'out')
+    logfile = os.path.join(tmp, 'bridge.log')
     cmd = '"%s" "%s" --text "{text}" --out "{out}" --ms 300' % (sys.executable, ENGINE)
-    args = [sys.executable, BRIDGE, '--port', str(PORT), '--queue', queue, '--outdir', outdir,
-            '--engine-cmd', cmd, '--keep', '5', '--target-sr', '0']
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    # 端口被系统保留时换一个再来（最多 3 次）
+    proc = None
+    for attempt in range(3):
+        PORT = pick_port()
+        BASE = 'http://127.0.0.1:%d' % PORT
+        args = [sys.executable, BRIDGE, '--port', str(PORT), '--queue', queue, '--outdir', outdir,
+                '--engine-cmd', cmd, '--keep', '5', '--target-sr', '0']
+        lf = open(logfile, 'w', encoding='utf-8')
+        proc = subprocess.Popen(args, stdout=lf, stderr=subprocess.STDOUT)
+        try:
+            h = wait_up(deadline=15, logfile=logfile, proc=proc)
+            break
+        except RuntimeError:
+            if attempt == 2:
+                raise
+            print('  端口 %d 起不来，换一个重试' % PORT)
+            try:
+                proc.terminate(); proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
     try:
-        h = wait_up()
         ok(h.get('ok') is True, '/health 返回 ok')
         ok(h.get('engine') == 'cmd', '/health 报告引擎形态是 cmd')
         ok(h.get('queue_len') == 0, '开始时队列为空')
