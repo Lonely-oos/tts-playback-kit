@@ -18,6 +18,14 @@ import time
 import urllib.request
 import wave
 
+# Windows 上 stdout 被重定向时默认是 charmap（cp1252/cp936），print 中文会抛
+# UnicodeEncodeError。CI 里连测试脚本自己都因此挂了 —— 所有会打印中文的入口都要这一句。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BRIDGE = os.path.join(ROOT, 'bridge', 'tts_bridge.py')
