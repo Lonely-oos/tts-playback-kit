@@ -65,6 +65,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 VERSION = '1.0.0'
 
+# Windows 上 stdout 被重定向到文件时，默认编码是 charmap（cp1252/cp936 之类），
+# print() 中文会直接抛 UnicodeEncodeError 把服务干掉。
+# 这不是"日志难看"，是**起不来** —— CI 上真栽过一次。
+# 所以：能改就改成 UTF-8，改不了就退化成 replace，绝不让日志拖死主流程。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------- 配置
 
 
@@ -104,7 +114,13 @@ LOCK = threading.Lock()
 
 def log(msg):
     line = '%s  %s' % (time.strftime('%H:%M:%S'), msg)
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except Exception:
+        try:
+            print(line.encode('utf-8', 'replace').decode('ascii', 'replace'), flush=True)
+        except Exception:
+            pass   # 日志怎么写不是业务；业务不能因为日志死
     try:
         with open(os.path.join(CFG.outdir, 'bridge.log'), 'a', encoding='utf-8') as f:
             f.write(line + '\n')

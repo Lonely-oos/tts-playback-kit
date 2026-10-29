@@ -156,8 +156,10 @@ python bridge/tts_bridge.py --engine-cmd 'piper --model zh_CN.onnx --output_file
 
 1. **后台无窗口 = OBS 采不到**（最常见）。播放器必须可见。
 2. **`SoundPlayer` 只吃 PCM wav**。引擎回 mp3/ogg 要先转，用 ffmpeg。
-3. **中文控制台编码**：Windows 控制台默认 GBK，Python 打印 UTF-8 会乱码；
-   bridge 里跟随 `PYTHONIOENCODING`，文件一律 UTF-8。
+3. **stdout 重定向会要命**：Windows 上把输出重定向到文件时，默认编码是 charmap，
+   `print()` 中文直接抛 `UnicodeEncodeError` —— **服务起不来**，不是"日志难看"。
+   bridge 启动时把 stdout/stderr 改成 UTF-8（失败则 replace），且 `log()` 自身不抛。
+   （这条是 CI 在 Windows 上第一次跑就抓到的。）
 4. **代理会拖死下载/请求**：bridge 启动时清空 `*_PROXY` 环境变量（本地服务不需要代理，
    而代理反而可能让本地请求绕出去）。
 5. **抢占是"清空"不是"淡出"**：正在播的那句会被硬停（`Stop()`）。要淡出得在播放端做，
