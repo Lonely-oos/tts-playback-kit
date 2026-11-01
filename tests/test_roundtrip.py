@@ -160,6 +160,36 @@ def main():
         code, r = post('/warmup', {})
         ok(code == 200, '/warmup 有响应')
 
+        # ── TTS-01：命令注入（外部审查 2026-11-01）────────────────
+        marker = os.path.join(tmp, 'pwned.txt')
+        evil = 'x"; touch "%s"; echo "' % marker
+        code, r = post('/tts', {'text': evil})
+        ok(code == 200, 'TTS-01 含引号/分号的文本仍被当作普通文本（%d）' % code)
+        ok(not os.path.exists(marker), 'TTS-01 没有产生命令注入副作用文件')
+        txts = sorted(f for f in os.listdir(queue) if f.endswith('.txt'))
+        ok(any('touch' in open(os.path.join(queue, f), encoding='utf-8').read() for f in txts),
+           'TTS-01 文本里的命令字样原样留在元数据里（说明没被 shell 执行）')
+
+        # ── TTS-06：请求体上限 ────────────────────────────────────
+        import http.client
+        conn = http.client.HTTPConnection('127.0.0.1', PORT, timeout=10)
+        conn.request('POST', '/tts', body=b'x' * 200000,
+                     headers={'Content-Type': 'application/json', 'Content-Length': '200000'})
+        resp = conn.getresponse()
+        ok(resp.status == 413, 'TTS-06 超大请求体被拒绝（%d）' % resp.status)
+        conn.close()
+
+        # ── TTS-05 / TTS-02：序号单调 + 原子交接 ──────────────────
+        for i in range(3):
+            post('/tts', {'text': '排序测试 %d' % i})
+        wavs2 = sorted(f for f in os.listdir(queue) if f.endswith('.wav'))
+        ids = [int(f.split('_')[0]) for f in wavs2]
+        ok(ids == sorted(ids), 'TTS-05 文件名前缀单调递增（%s）' % ids[:3])
+        ok(all(len(str(i)) == 13 for i in ids), 'TTS-05 前缀是 13 位毫秒时间戳，不回绕')
+        ok(all(os.path.exists(os.path.join(queue, f + '.txt')) for f in wavs2),
+           'TTS-02 每个 wav 都有对应 txt（wav 出现即就绪）')
+        ok(not [f for f in os.listdir(queue) if f.endswith('.part')], 'TTS-02 没有残留 .part 半成品')
+
         print('\n' + ('===== %d FAILED =====' % len(FAILS) if FAILS else '===== all checks passed ====='))
         return 1 if FAILS else 0
     finally:

@@ -84,6 +84,10 @@ class Config:
         self.queue = os.path.abspath(a.queue)
         self.outdir = os.path.abspath(a.outdir)
         self.engine_cmd = a.engine_cmd or ''
+        # 启动时就切好，运行期不再让 shell 参与（见 synth 里的 TTS-01 说明）
+        import shlex
+        self.engine_argv = shlex.split(self.engine_cmd) if self.engine_cmd else []
+        self.max_body = a.max_body
         self.engine_http = a.engine_http or ''
         self.engine_timeout = a.engine_timeout
         self.keep = a.keep
@@ -148,9 +152,13 @@ def synth(text, out_wav):
     """
     t0 = time.time()
     if CFG.engine_cmd:
-        cmd = CFG.engine_cmd.replace('{text}', text).replace('{out}', out_wav)
-        # 用 shell 形式的字符串是因为模板里可能有引号和管道；生产环境请自己确保 text 已转义
-        r = subprocess.run(cmd, shell=True, capture_output=True, timeout=CFG.engine_timeout)
+        # TTS-01（外部审查 2026-11-01，高）：原来把请求文本插进字符串再交给 shell 解释，
+        # 只要 text 里有引号/分号/`$()` 就能注入命令，而这个 HTTP 端点默认没有认证。
+        # 现在：模板按 shell 语法**切分成 argv 一次**，占位符在**单个参数内部**替换，
+        # 然后 `shell=False` 直接 exec —— 文本里有什么字符都只是参数内容。
+        argv = [a.replace('{text}', text).replace('{out}', out_wav)
+                for a in CFG.engine_argv]
+        r = subprocess.run(argv, shell=False, capture_output=True, timeout=CFG.engine_timeout)
         if r.returncode != 0:
             err = (r.stderr or b'').decode('utf-8', 'replace')[-400:]
             raise RuntimeError('engine 退出码 %d: %s' % (r.returncode, err))
@@ -192,16 +200,31 @@ def synth(text, out_wav):
 
 
 def enqueue(wav, text):
-    """放进队列。文件名带序号，保证播放顺序稳定（文件名排序即可）。"""
+    """
+    放进队列。
+
+    TTS-05（外部审查 2026-11-01）：原来用 `count % 100000` 做前缀，取模会回绕 ——
+    绕回之后新任务的编号比旧积压任务小，按文件名排序就插到队首去了。
+    现在用 **13 位毫秒时间戳**做前缀（单调、不回绕、跨重启也对），
+    文件名排序即时间顺序。
+
+    TTS-02：原来先 move wav 再写 .txt，播放器有机会看到"有音频没文本"的半成品。
+    现在**先写 txt，最后把 wav rename 进队列** —— wav 的出现就是"任务已就绪"的信号。
+    """
     with LOCK:
         STATE['synth_count'] += 1
-        seq = STATE['synth_count'] % 100000
-    name = '%06d_%d.wav' % (seq, int(time.time() * 1000) % 100000)
+    name = '%013d_%06d.wav' % (int(time.time() * 1000), STATE['synth_count'] % 1000000)
     dest = os.path.join(CFG.queue, name)
-    shutil.move(wav, dest)
-    # 元数据落在旁边，播放器可以显示"现在在念什么"
-    with open(os.path.join(CFG.queue, name + '.txt'), 'w', encoding='utf-8') as f:
+    txt = dest + '.txt'
+    tmp_txt = txt + '.part'
+    with open(tmp_txt, 'w', encoding='utf-8') as f:
         f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_txt, txt)          # 元数据先就位
+    tmp_wav = dest + '.part'
+    shutil.move(wav, tmp_wav)
+    os.replace(tmp_wav, dest)         # wav 最后出现 = 就绪信号
     prune()
     return dest
 
@@ -214,6 +237,16 @@ def prune():
             for p in (os.path.join(CFG.queue, old), os.path.join(CFG.queue, old + '.txt')):
                 if os.path.exists(p):
                     os.remove(p)
+        # 清理崩溃留下的半成品（.part 超过 1 分钟才算残留）
+        now = time.time()
+        for f in os.listdir(CFG.queue):
+            if f.endswith('.part'):
+                p = os.path.join(CFG.queue, f)
+                try:
+                    if now - os.path.getmtime(p) > 60:
+                        os.remove(p)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -268,7 +301,18 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {'ok': False, 'error': 'not found'})
 
     def do_POST(self):
-        n = int(self.headers.get('Content-Length') or 0)
+        # TTS-06（外部审查 2026-11-01）：原来按 Content-Length 一次性读完整请求体，
+        # 任何客户端都能用一个超大长度把内存吃干（端点默认无认证）。
+        raw_len = self.headers.get('Content-Length')
+        try:
+            n = int(raw_len or 0)
+        except ValueError:
+            return self._send(400, {'ok': False, 'error': 'Content-Length 不是整数'})
+        if n > CFG.max_body:
+            return self._send(413, {
+                'ok': False,
+                'error': '请求体过大：%d 字节 > 上限 %d' % (n, CFG.max_body),
+            })
         raw = self.rfile.read(n) if n else b'{}'
         try:
             body = json.loads(raw.decode('utf-8'))
@@ -323,6 +367,8 @@ def main():
     ap.add_argument('--engine-http', default='', help='HTTP 引擎地址（POST JSON）')
     ap.add_argument('--engine-timeout', type=float, default=120)
     ap.add_argument('--keep', type=int, default=200, help='队列最多保留多少条（0=不限）')
+    ap.add_argument('--max-body', type=int, default=65536,
+                    help='TTS-06：请求体字节上限，超过返回 413（默认 64 KiB）')
     ap.add_argument('--ffmpeg', default='', help='可选：用于统一采样率')
     ap.add_argument('--target-sr', type=int, default=32000, help='重采样目标（0=不转）')
     ap.add_argument('--warmup-text', default='预热。', help='启动后自动预热的一句；空字符串则跳过')

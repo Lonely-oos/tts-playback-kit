@@ -62,10 +62,17 @@ $form.Controls.Add($lbl)
 # ---------------- 播放 ----------------
 $player = $null
 if (-not $Ffplay) { $player = New-Object System.Media.SoundPlayer }
+# TTS-03（外部审查 2026-11-01）：只记录并终止**本进程启动的**播放子进程。
+# 原来用 Get-Process ffplay | Stop-Process 会把用户自己的 ffplay 一起杀掉。
+$script:ffplayProc = $null
 
 function Play-File($path) {
     if ($Ffplay) {
-        & $Ffplay -nodisp -autoexit -loglevel quiet $path 2>$null
+        $script:ffplayProc = Start-Process -FilePath $Ffplay `
+            -ArgumentList @('-nodisp', '-autoexit', '-loglevel', 'quiet', $path) `
+            -PassThru -WindowStyle Hidden
+        $script:ffplayProc.WaitForExit()
+        $script:ffplayProc = $null
     } else {
         $player.SoundLocation = $path
         $player.PlaySync()        # 同步：一句话播完再取下一句，天然串行
@@ -83,7 +90,14 @@ $form.Add_Shown({
             Remove-Item $mark -Force -ErrorAction SilentlyContinue
             Get-ChildItem $QueueDir -Filter '*.wav' -ErrorAction SilentlyContinue |
                 Remove-Item -Force -ErrorAction SilentlyContinue
-            try { if ($Ffplay) { Get-Process ffplay -ErrorAction SilentlyContinue | Stop-Process -Force } else { $player.Stop() } } catch {}
+            try {
+                if ($Ffplay) {
+                    if ($script:ffplayProc -and -not $script:ffplayProc.HasExited) {
+                        $script:ffplayProc.Kill()
+                        $script:ffplayProc = $null
+                    }
+                } else { $player.Stop() }
+            } catch {}
             $lbl.Text = "$Title`r`n已抢占，队列清空"
             Write-Log '收到抢占标记，已清队'
             return
@@ -103,15 +117,29 @@ $form.Add_Shown({
         $form.Refresh()
 
         $sw = [Diagnostics.Stopwatch]::StartNew()
+        $failed = $false
         try {
             Play-File $next.FullName
             Write-Log ("播放 $($next.Name) 用时 $([int]$sw.Elapsed.TotalMilliseconds) ms")
         } catch {
+            $failed = $true
             Write-Log "播放失败 $($next.Name): $_"
         } finally {
             $sw.Stop()
-            Remove-Item $next.FullName -Force -ErrorAction SilentlyContinue
-            Remove-Item $txtPath -Force -ErrorAction SilentlyContinue
+            if ($failed) {
+                # TTS-04（外部审查 2026-11-01）：失败产物不再直接删 —— 那等于把现场毁掉。
+                # 移到 failed/ 保留 wav 与文本，人可以听、可以重放、可以查原因。
+                $failDir = Join-Path $OutDir 'failed'
+                New-Item -ItemType Directory -Force -Path $failDir | Out-Null
+                try { Move-Item $next.FullName (Join-Path $failDir $next.Name) -Force } catch {}
+                if (Test-Path $txtPath) {
+                    try { Move-Item $txtPath (Join-Path $failDir (Split-Path $txtPath -Leaf)) -Force } catch {}
+                }
+                Write-Log "  已移入 failed/：$($next.Name)"
+            } else {
+                Remove-Item $next.FullName -Force -ErrorAction SilentlyContinue
+                Remove-Item $txtPath -Force -ErrorAction SilentlyContinue
+            }
         }
     })
     $timer.Start()

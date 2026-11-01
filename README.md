@@ -141,8 +141,11 @@ python bridge/tts_bridge.py \
 python bridge/tts_bridge.py --engine-cmd 'piper --model zh_CN.onnx --output_file "{out}"'
 ```
 
-> ⚠️ `--engine-cmd` 走的是 shell 字符串替换。**文本内容必须来自可信来源**，
-> 或者你自己在外面做转义；生产环境建议改用 `--engine-http`。
+> ⚠️ **`--engine-cmd` 不经过 shell（2026-11-01 起）。**
+> 模板先按 shell 语法切分成参数数组，占位符只在**单个参数内部**替换，然后直接 exec。
+> 所以文本里的引号、分号、`$()` 都只是普通字符，不会被执行。
+> 代价：模板里**不能**用管道、重定向、`&&`。需要复杂命令行就写个脚本再调用它，
+> 或者用 `--engine-http`。
 
 ## OBS 配置（三步）
 
@@ -164,7 +167,13 @@ python bridge/tts_bridge.py --engine-cmd 'piper --model zh_CN.onnx --output_file
    而代理反而可能让本地请求绕出去）。
 5. **抢占是"清空"不是"淡出"**：正在播的那句会被硬停（`Stop()`）。要淡出得在播放端做，
    本仓库没做——因为多数场景要的是"立刻闭嘴"。
-6. **`.ps1` 必须存成「带 BOM 的 UTF-8」**。PowerShell 5.1 没有 BOM 时按 ANSI 读，
+6. **抢占只停自己启动的播放子进程**。播放器记录自己 spawn 的 ffplay PID，
+   不会再用 `Get-Process ffplay | Stop-Process` 把你自己开的播放器一起杀掉。
+   播放失败的产物会被移到 `输出/failed/`（不删），可以听、可以重放。
+7. **队列文件名是 13 位毫秒时间戳 + 计数**，单调递增、不回绕；wav 在 txt 之后原子出现，
+   所以"看到 wav"就等于"这一条已就绪"。
+8. **请求体上限 64 KiB**（`--max-body`），超了返回 413。
+9. **`.ps1` 必须存成「带 BOM 的 UTF-8」**。PowerShell 5.1 没有 BOM 时按 ANSI 读，
    中文全碎、字符串引号被拆开，报的却是"函数参数列表缺少 )"这类看不懂的错。
    （这条是写这个仓库时真踩到的。）
 7. **队列不持久化业务语义**：wav 播完即删。要审计"说过什么"请自己记台账。
