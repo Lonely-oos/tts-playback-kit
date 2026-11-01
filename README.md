@@ -196,3 +196,11 @@ python tests/test_roundtrip.py     # 起 bridge（假引擎）→ 发/收/抢占
 
 CI 在 ubuntu 与 windows 上跑这份测试（Python 3.11 / 3.12）。
 **不需要 GPU、不需要模型、不需要 ffmpeg** —— 假引擎是纯标准库生成的 wav。
+
+---
+
+## 变更记录
+
+每次行为变化与修掉的真实问题都在 [CHANGELOG.md](CHANGELOG.md)。
+最近一次（1.1.0）是按外部静态审查修的 6 条 TTS 问题，每条都有对应测试。
+
